@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CSS/LESS 编辑器 CM6
 // @namespace    http://tampermonkey/
-// @version      12.2
+// @version      12.4
 // @description  CodeMirror 6 CSS/LESS 编辑器，支持格式化、搜索替换、语法错误提示、点击预览注入页面
 // @match        *://*/*
 // @grant        none
@@ -627,6 +627,8 @@
     }
 
     function createLessLinter({ syntaxTree, ensureSyntaxTree }) {
+        const cssWideValues = new Set(['inherit', 'initial', 'unset', 'revert', 'revert-layer']);
+
         function collectSyntaxErrors(view) {
             const diagnostics = [];
             const state = view.state;
@@ -647,37 +649,221 @@
             return diagnostics;
         }
 
+        function isWordChar(char) {
+            return /[a-zA-Z0-9_-]/.test(char || '');
+        }
+
+        function splitDeclarations(block) {
+            const declarations = [];
+            let start = 0;
+            let quote = '';
+            let parenDepth = 0;
+
+            for (let index = 0; index <= block.length; index += 1) {
+                const char = block[index] || ';';
+                const next = block[index + 1];
+
+                if (quote) {
+                    if (char === '\\') {
+                        index += 1;
+                    } else if (char === quote) {
+                        quote = '';
+                    }
+                    continue;
+                }
+
+                if (char === '/' && next === '*') {
+                    const commentEnd = block.indexOf('*/', index + 2);
+                    index = commentEnd >= 0 ? commentEnd + 1 : block.length;
+                    continue;
+                }
+
+                if (char === '"' || char === "'") {
+                    quote = char;
+                    continue;
+                }
+
+                if (char === '(') {
+                    parenDepth += 1;
+                    continue;
+                }
+
+                if (char === ')') {
+                    parenDepth = Math.max(0, parenDepth - 1);
+                    continue;
+                }
+
+                if (char !== ';' || parenDepth > 0) continue;
+
+                const raw = block.slice(start, index).trim();
+                start = index + 1;
+
+                if (!raw || raw.startsWith('@') || raw.includes('{') || raw.includes('}')) continue;
+
+                const colon = raw.indexOf(':');
+                if (colon <= 0) continue;
+
+                const property = raw.slice(0, colon).trim();
+                const value = raw.slice(colon + 1).replace(/!important\s*$/i, '').trim();
+
+                if (property && value) {
+                    declarations.push({ property, value });
+                }
+            }
+
+            return declarations;
+        }
+
+        function collectCssDeclarations(css) {
+            const declarations = [];
+            const stack = [];
+            let quote = '';
+            let blockStart = -1;
+
+            for (let index = 0; index < css.length; index += 1) {
+                const char = css[index];
+                const next = css[index + 1];
+
+                if (quote) {
+                    if (char === '\\') {
+                        index += 1;
+                    } else if (char === quote) {
+                        quote = '';
+                    }
+                    continue;
+                }
+
+                if (char === '/' && next === '*') {
+                    const commentEnd = css.indexOf('*/', index + 2);
+                    index = commentEnd >= 0 ? commentEnd + 1 : css.length;
+                    continue;
+                }
+
+                if (char === '"' || char === "'") {
+                    quote = char;
+                    continue;
+                }
+
+                if (char === '{') {
+                    stack.push(index);
+                    blockStart = index + 1;
+                    continue;
+                }
+
+                if (char !== '}') continue;
+
+                const start = stack.pop();
+                if (start == null) continue;
+
+                const block = css.slice(start + 1, index);
+                declarations.push(...splitDeclarations(block));
+                blockStart = stack.length ? stack[stack.length - 1] + 1 : -1;
+            }
+
+            return declarations;
+        }
+
+        function supportsDeclaration(property, value) {
+            if (!window.CSS?.supports) return true;
+            if (!property || !value) return true;
+            if (property.startsWith('--')) return true;
+            if (property.includes('@') || value.includes('@')) return true;
+            if (cssWideValues.has(value.toLowerCase())) return true;
+
+            try {
+                return CSS.supports(property, value);
+            } catch {
+                return false;
+            }
+        }
+
+        function findSourcePropertyRange(state, property, searchStart) {
+            const code = state.doc.toString();
+            let from = code.indexOf(property, searchStart);
+
+            while (from >= 0) {
+                const before = code[from - 1];
+                let afterIndex = from + property.length;
+
+                while (/\s/.test(code[afterIndex] || '')) {
+                    afterIndex += 1;
+                }
+
+                if (!isWordChar(before) && code[afterIndex] === ':') {
+                    return {
+                        from,
+                        to: from + property.length,
+                        nextSearchStart: afterIndex + 1
+                    };
+                }
+
+                from = code.indexOf(property, from + property.length);
+            }
+
+            from = code.indexOf(property);
+            return {
+                from: from >= 0 ? from : 0,
+                to: from >= 0 ? from + property.length : Math.min(1, state.doc.length),
+                nextSearchStart: from >= 0 ? from + property.length : searchStart
+            };
+        }
+
+        function collectUnsupportedCssDiagnostics(state, css) {
+            const diagnostics = [];
+            const declarations = collectCssDeclarations(css);
+            let searchStart = 0;
+
+            for (const { property, value } of declarations) {
+                if (supportsDeclaration(property, value)) continue;
+
+                const range = findSourcePropertyRange(state, property, searchStart);
+                searchStart = range.nextSearchStart;
+
+                diagnostics.push({
+                    from: range.from,
+                    to: Math.max(range.from + 1, range.to),
+                    severity: 'warning',
+                    message: `CSS 属性或属性值可能无效：${property}: ${value}`
+                });
+            }
+
+            return diagnostics;
+        }
+
         return async function lessLintSource(view) {
             const code = view.state.doc.toString();
-            const diagnostics = collectSyntaxErrors(view);
 
-            if (!code.trim() || !window.less?.render) {
-                return diagnostics;
+            if (!code.trim()) {
+                return [];
+            }
+
+            if (!window.less?.render) {
+                return collectSyntaxErrors(view);
             }
 
             try {
-                await window.less.render(code, {
+                const output = await window.less.render(code, {
                     javascriptEnabled: false
                 });
 
-                return diagnostics;
+                // LESS 编译通过后继续校验编译产物，补足无效 CSS 属性名和属性值提示。
+                return collectUnsupportedCssDiagnostics(view.state, output.css);
             } catch (error) {
                 const lineNo = Math.max(1, Number(error?.line) || 1);
                 const columnNo = Math.max(0, Number(error?.column) || 0);
                 const line = view.state.doc.line(Math.min(lineNo, view.state.doc.lines));
                 const from = Math.min(line.from + columnNo, line.to);
 
-                diagnostics.push({
+                return [{
                     from,
                     to: Math.min(from + 1, line.to),
                     severity: 'error',
                     message: `LESS 编译错误：${error?.message || error?.type || '未知错误'}`
-                });
-
-                return diagnostics;
+                }];
             }
         };
     }
+
 
     async function applyCode() {
         if (!editor) return;
